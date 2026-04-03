@@ -1,105 +1,29 @@
-// YouTube audio proxy server — v4
+// YouTube audio proxy server — v5
+// Uses youtubei.js download() for streaming (handles all cipher/token internally)
 import { createServer } from 'http';
 import { Innertube } from 'youtubei.js';
 
 const PORT = process.env.PORT || 5000;
-const ANDROID_UA = 'com.google.android.youtube/19.02.39 (Linux; U; Android 13; Pixel 7)';
 
-const cache = new Map();
-const CACHE_TTL = 2 * 60 * 60 * 1000;
+const cache = new Map(); // videoId -> { info, expires, client }
+const CACHE_TTL = 30 * 60 * 1000; // 30 min (shorter — sessions expire)
 
-let tubes = {};
-let tubeCreatedAt = {};
-const TUBE_TTL = 30 * 60 * 1000;
+let tube = null;
+let tubeCreatedAt = 0;
+const TUBE_TTL = 25 * 60 * 1000;
 
-async function getTube(clientType) {
-  if (tubes[clientType] && (Date.now() - (tubeCreatedAt[clientType] || 0)) < TUBE_TTL) {
-    return tubes[clientType];
-  }
-  console.log(`[yt] new session: ${clientType}`);
-  const opts = { generate_session_locally: true };
-  if (clientType !== 'WEB') opts.client_type = clientType;
-  tubes[clientType] = await Innertube.create(opts);
-  tubeCreatedAt[clientType] = Date.now();
-  return tubes[clientType];
+async function getTube() {
+  if (tube && (Date.now() - tubeCreatedAt) < TUBE_TTL) return tube;
+  console.log('[yt] Creating Innertube session...');
+  tube = await Innertube.create({
+    generate_session_locally: true,
+    // retrieve_player: true is default — needed for download()
+  });
+  tubeCreatedAt = Date.now();
+  return tube;
 }
 
-function resetTube(ct) { tubes[ct] = null; tubeCreatedAt[ct] = 0; }
-
-async function tryClient(videoId, clientType) {
-  const tube = await getTube(clientType);
-  let info;
-  try {
-    info = await tube.getBasicInfo(videoId);
-  } catch (e) {
-    console.log(`[yt] ${clientType} basic err: ${e.message}`);
-    resetTube(clientType);
-    const fresh = await getTube(clientType);
-    info = await fresh.getBasicInfo(videoId);
-  }
-
-  // Get all audio formats with URLs
-  const adaptive = info.streaming_data?.adaptive_formats || [];
-  const audioFmts = adaptive.filter(f => f.mime_type?.includes('audio') && f.url);
-  
-  if (audioFmts.length === 0) {
-    // Try chooseFormat as fallback (handles deciphering)
-    try {
-      const fmt = info.chooseFormat({ type: 'audio', quality: 'bestefficiency' });
-      if (fmt?.url) {
-        return { url: fmt.url, mime: fmt.mime_type?.split(';')[0] || 'audio/mp4', size: Number(fmt.content_length || 0) };
-      }
-    } catch {}
-    
-    // Try combined formats
-    const combined = (info.streaming_data?.formats || []).filter(f => f.url);
-    if (combined.length > 0) {
-      return { url: combined[0].url, mime: combined[0].mime_type?.split(';')[0] || 'video/mp4', size: Number(combined[0].content_length || 0) };
-    }
-    return null;
-  }
-
-  // Prefer mp4, pick LOWEST bitrate (most compatible, fastest)
-  const mp4 = audioFmts.filter(f => f.mime_type?.includes('mp4'));
-  const pick = (mp4.length > 0 ? mp4 : audioFmts).sort((a, b) => (a.bitrate || 0) - (b.bitrate || 0))[0];
-  return { url: pick.url, mime: pick.mime_type?.split(';')[0] || 'audio/mp4', size: Number(pick.content_length || 0) };
-}
-
-async function getAudioUrl(videoId) {
-  const cached = cache.get(videoId);
-  if (cached && cached.expires > Date.now()) return cached;
-
-  for (const ct of ['ANDROID', 'WEB']) {
-    try {
-      const r = await tryClient(videoId, ct);
-      if (r) {
-        // Verify the URL actually works before caching
-        try {
-          const probe = await fetch(r.url, { method: 'HEAD', headers: { 'User-Agent': ANDROID_UA } });
-          if (!probe.ok) {
-            console.log(`[yt] ${ct} URL probe failed: ${probe.status} for ${videoId}`);
-            continue;
-          }
-          // Update size from probe if we didn't have it
-          if (!r.size) r.size = Number(probe.headers.get('content-length') || 0);
-        } catch (e) {
-          console.log(`[yt] ${ct} URL probe error: ${e.message}`);
-          continue;
-        }
-        
-        const entry = { ...r, expires: Date.now() + CACHE_TTL, client: ct };
-        console.log(`[yt] OK ${ct}: ${videoId} (${entry.size}b)`);
-        cache.set(videoId, entry);
-        return entry;
-      }
-      console.log(`[yt] SKIP ${ct}: no formats for ${videoId}`);
-    } catch (e) {
-      console.log(`[yt] FAIL ${ct}: ${e.message}`);
-      resetTube(ct);
-    }
-  }
-  return null;
-}
+function resetTube() { tube = null; tubeCreatedAt = 0; }
 
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -108,44 +32,129 @@ function setCors(res) {
   res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Type, Accept-Ranges');
 }
 
-async function streamAudio(audio, range, res) {
-  const h = { 'User-Agent': ANDROID_UA };
-  if (range) h['Range'] = range;
+// Get video info with detailed logging
+async function getInfo(videoId) {
+  const cached = cache.get(videoId);
+  if (cached && cached.expires > Date.now()) return cached.info;
 
-  let upstream;
+  const yt = await getTube();
+  let info;
   try {
-    upstream = await fetch(audio.url, { headers: h });
+    info = await yt.getBasicInfo(videoId);
   } catch (e) {
-    console.log(`[yt] stream fetch error: ${e.message}`);
-    return null;
+    console.log(`[yt] getBasicInfo error: ${e.message}, refreshing session`);
+    resetTube();
+    const fresh = await getTube();
+    info = await fresh.getBasicInfo(videoId);
   }
+
+  // Log what we got
+  const sd = info.streaming_data;
+  const af = sd?.adaptive_formats || [];
+  const f = sd?.formats || [];
+  const audioAf = af.filter(x => x.mime_type?.includes('audio'));
+  const withUrl = audioAf.filter(x => x.url);
+  console.log(`[yt] ${videoId}: adaptive=${af.length} audio=${audioAf.length} withUrl=${withUrl.length} combined=${f.length} playability=${info.playability_status?.status}`);
+
+  if (info.playability_status?.status !== 'OK') {
+    console.log(`[yt] ${videoId} not playable: ${info.playability_status?.status} - ${info.playability_status?.reason || ''}`);
+  }
+
+  cache.set(videoId, { info, expires: Date.now() + CACHE_TTL });
+  return info;
+}
+
+// Stream audio using youtubei.js download() — handles all cipher/token internally
+async function streamViaDownload(videoId, range, res) {
+  const yt = await getTube();
+  const info = await getInfo(videoId);
+
+  // Check if there are any audio formats at all
+  const af = info.streaming_data?.adaptive_formats || [];
+  const audioFormats = af.filter(x => x.mime_type?.includes('audio'));
   
-  if (!upstream.ok && upstream.status !== 206) {
-    console.log(`[yt] stream upstream ${upstream.status} for url`);
-    return null;
+  if (audioFormats.length === 0) {
+    // No adaptive audio — try download with video (will be larger but works)
+    const combined = info.streaming_data?.formats || [];
+    if (combined.length === 0) {
+      return { ok: false, error: 'No formats available' };
+    }
   }
 
-  const rh = { 'Content-Type': audio.mime, 'Accept-Ranges': 'bytes', 'Cache-Control': 'public, max-age=3600' };
+  try {
+    // Use download() which handles everything internally
+    const stream = await info.download({
+      type: 'audio',
+      quality: 'bestefficiency',
+    });
 
+    // Get format info for headers
+    let mime = 'audio/mp4';
+    let size = 0;
+    try {
+      const fmt = info.chooseFormat({ type: 'audio', quality: 'bestefficiency' });
+      mime = fmt.mime_type?.split(';')[0] || 'audio/mp4';
+      size = Number(fmt.content_length || 0);
+    } catch {}
+
+    const headers = {
+      'Content-Type': mime,
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'public, max-age=1800',
+    };
+    if (size) headers['Content-Length'] = String(size);
+    res.writeHead(200, headers);
+
+    // Pipe the ReadableStream to response
+    const reader = stream.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!res.writableEnded) res.write(Buffer.from(value));
+    }
+    res.end();
+    return { ok: true };
+  } catch (e) {
+    console.log(`[yt] download() failed for ${videoId}: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+}
+
+// Fallback: try to extract URL and proxy manually
+async function streamViaProxy(videoId, range, res) {
+  const info = await getInfo(videoId);
+  const af = info.streaming_data?.adaptive_formats || [];
+  const audioFmts = af.filter(f => f.mime_type?.includes('audio') && f.url);
+  const combined = (info.streaming_data?.formats || []).filter(f => f.url);
+  const allFmts = [...audioFmts, ...combined];
+
+  if (allFmts.length === 0) return { ok: false, error: 'No streamable formats' };
+
+  const mp4 = audioFmts.filter(f => f.mime_type?.includes('mp4'));
+  const pick = (mp4.length > 0 ? mp4 : allFmts).sort((a, b) => (a.bitrate||0) - (b.bitrate||0))[0];
+
+  const fetchH = { 'User-Agent': 'com.google.android.youtube/19.02.39 (Linux; U; Android 13; Pixel 7)' };
+  if (range) fetchH['Range'] = range;
+
+  const upstream = await fetch(pick.url, { headers: fetchH });
+  if (!upstream.ok && upstream.status !== 206) {
+    return { ok: false, error: `upstream ${upstream.status}` };
+  }
+
+  const rh = { 'Content-Type': pick.mime_type?.split(';')[0] || 'audio/mp4', 'Accept-Ranges': 'bytes', 'Cache-Control': 'public, max-age=1800' };
   if (range && upstream.status === 206) {
     if (upstream.headers.get('content-length')) rh['Content-Length'] = upstream.headers.get('content-length');
     if (upstream.headers.get('content-range')) rh['Content-Range'] = upstream.headers.get('content-range');
     res.writeHead(206, rh);
   } else {
-    rh['Content-Length'] = String(audio.size || upstream.headers.get('content-length') || '');
+    rh['Content-Length'] = String(pick.content_length || upstream.headers.get('content-length') || '');
     res.writeHead(200, rh);
   }
 
   const reader = upstream.body.getReader();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!res.writableEnded) res.write(value);
-    }
-  } catch {}
+  try { while (true) { const { done, value } = await reader.read(); if (done) break; if (!res.writableEnded) res.write(value); } } catch {}
   res.end();
-  return true;
+  return { ok: true };
 }
 
 const server = createServer(async (req, res) => {
@@ -155,55 +164,76 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const videoId = url.searchParams.get('id');
 
+  // Health
+  if (url.pathname === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', v: 5, cache: cache.size }));
+    return;
+  }
+
+  // Test/debug endpoint
+  if (url.pathname.startsWith('/test')) {
+    if (!videoId) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end('{"error":"need ?id="}'); return; }
+    try {
+      cache.delete(videoId);
+      const info = await getInfo(videoId);
+      const af = info.streaming_data?.adaptive_formats || [];
+      const audioFmts = af.filter(f => f.mime_type?.includes('audio'));
+      const withUrl = audioFmts.filter(f => f.url);
+      const combined = info.streaming_data?.formats || [];
+      
+      // Try download to see if it works
+      let downloadOk = false;
+      let downloadErr = '';
+      try {
+        const stream = await info.download({ type: 'audio', quality: 'bestefficiency' });
+        // Read just a tiny bit to verify
+        const reader = stream.getReader();
+        const { value } = await reader.read();
+        downloadOk = value && value.length > 0;
+        reader.cancel();
+      } catch (e) { downloadErr = e.message; }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        playability: info.playability_status?.status,
+        reason: info.playability_status?.reason || '',
+        adaptive: af.length,
+        audio: audioFmts.length,
+        audioWithUrl: withUrl.length,
+        combined: combined.length,
+        downloadOk,
+        downloadErr: downloadErr || undefined,
+      }));
+    } catch (e) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
   // HEAD
   if (req.method === 'HEAD' && videoId) {
     try {
-      const a = await getAudioUrl(videoId);
-      if (a) { res.writeHead(200, { 'Content-Type': a.mime, 'Content-Length': String(a.size), 'Accept-Ranges': 'bytes' }); }
-      else { res.writeHead(404); }
+      const info = await getInfo(videoId);
+      const af = info.streaming_data?.adaptive_formats || [];
+      const audio = af.filter(f => f.mime_type?.includes('audio'));
+      if (audio.length > 0 || (info.streaming_data?.formats || []).length > 0) {
+        const pick = audio[0] || info.streaming_data.formats[0];
+        res.writeHead(200, {
+          'Content-Type': pick.mime_type?.split(';')[0] || 'audio/mp4',
+          'Content-Length': String(pick.content_length || 0),
+          'Accept-Ranges': 'bytes',
+        });
+      } else { res.writeHead(404); }
     } catch { res.writeHead(500); }
     res.end();
     return;
   }
 
-  // Health
-  if (url.pathname === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', v: 4, cache: cache.size }));
-    return;
-  }
-
-  // Test endpoint — extracts AND verifies streaming works
-  if (url.pathname.startsWith('/test')) {
-    if (!videoId) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'need ?id=VIDEO_ID' }));
-      return;
-    }
-    try {
-      cache.delete(videoId);
-      const a = await getAudioUrl(videoId);
-      if (!a) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: 'No audio found' }));
-        return;
-      }
-      // Verify stream works by fetching first 1KB
-      const probe = await fetch(a.url, { headers: { 'User-Agent': ANDROID_UA, 'Range': 'bytes=0-1023' } });
-      const probeOk = probe.ok || probe.status === 206;
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: probeOk, client: a.client, mime: a.mime, size: a.size, streamStatus: probe.status }));
-    } catch (e) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: e.message }));
-    }
-    return;
-  }
-
-  // No video ID — show usage
   if (!videoId) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ service: 'raga-ytaudio', v: 4, test: '/test?id=dQw4w9WgXcQ' }));
+    res.end(JSON.stringify({ service: 'raga-ytaudio', v: 5, test: '/test?id=dQw4w9WgXcQ' }));
     return;
   }
 
@@ -211,35 +241,46 @@ const server = createServer(async (req, res) => {
 
   try {
     console.log(`[${new Date().toISOString()}] ${mode}: ${videoId}`);
-    const audio = await getAudioUrl(videoId);
-    if (!audio) {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'No audio found' }));
-      return;
-    }
 
     if (mode === 'json') {
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=3600' });
-      res.end(JSON.stringify({ url: audio.url, mime: audio.mime, size: audio.size }));
+      // JSON mode: return direct URL if available
+      const info = await getInfo(videoId);
+      const af = info.streaming_data?.adaptive_formats || [];
+      const audio = af.filter(f => f.mime_type?.includes('audio') && f.url);
+      if (audio.length > 0) {
+        const pick = audio.sort((a, b) => (a.bitrate||0) - (b.bitrate||0))[0];
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ url: pick.url, mime: pick.mime_type?.split(';')[0], size: Number(pick.content_length || 0) }));
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'No direct URL available' }));
       return;
     }
 
-    console.log(`[${new Date().toISOString()}] stream ${videoId} (${audio.size}b ${audio.client})`);
+    // Proxy mode: try download() first, then URL proxy fallback
     const range = req.headers.range || null;
-    let ok = await streamAudio(audio, range, res);
-    if (!ok) {
-      // URL might be expired — retry with fresh
-      cache.delete(videoId);
-      const fresh = await getAudioUrl(videoId);
-      if (fresh) ok = await streamAudio(fresh, range, res);
-      if (!ok && !res.headersSent) {
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Stream failed' }));
-      }
+
+    // Method 1: Use download() — handles cipher/tokens internally
+    const dlResult = await streamViaDownload(videoId, range, res);
+    if (dlResult.ok) return;
+
+    console.log(`[yt] download() failed: ${dlResult.error}, trying URL proxy`);
+
+    // Method 2: Direct URL proxy
+    if (!res.headersSent) {
+      const proxyResult = await streamViaProxy(videoId, range, res);
+      if (proxyResult.ok) return;
+      console.log(`[yt] proxy failed: ${proxyResult.error}`);
+    }
+
+    if (!res.headersSent) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'No audio available' }));
     }
   } catch (e) {
     console.error(`[${new Date().toISOString()}] ERR ${videoId}: ${e.message}`);
-    ['ANDROID', 'WEB'].forEach(c => resetTube(c));
+    resetTube();
     if (!res.headersSent) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: e.message }));
@@ -248,6 +289,6 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`YT audio proxy v4 on port ${PORT}`);
-  getTube('ANDROID').then(() => console.log('ANDROID ready')).catch(e => console.error('init fail:', e.message));
+  console.log(`YT audio proxy v5 on port ${PORT}`);
+  getTube().then(() => console.log('Session ready')).catch(e => console.error('Init fail:', e.message));
 });
