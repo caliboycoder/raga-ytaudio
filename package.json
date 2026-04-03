@@ -6,6 +6,6 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "youtubei.js": "^12.0.0"
+    "youtubei.js": "latest"
   }
 }

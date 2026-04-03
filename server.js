@@ -1,13 +1,9 @@
-// Minimal YouTube audio proxy server for Railway (free tier: 500 hrs/month)
-// Deploy: railway up
-
-import { Innertube } from 'youtubei.js';
+// YouTube audio proxy server for Railway
 import { createServer } from 'http';
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 8080;
 const ANDROID_UA = 'com.google.android.youtube/19.02.39 (Linux; U; Android 13; Pixel 7)';
 
-// Cache
 const cache = new Map();
 const CACHE_TTL = 2 * 60 * 60 * 1000;
 
@@ -15,7 +11,13 @@ async function getAudioUrl(videoId) {
   const cached = cache.get(videoId);
   if (cached && cached.expires > Date.now()) return cached;
 
-  const tube = await Innertube.create({ client_type: 'ANDROID', generate_session_locally: true });
+  // Dynamic import to get latest version
+  const { Innertube } = await import('youtubei.js');
+  const tube = await Innertube.create({
+    client_type: 'ANDROID',
+    generate_session_locally: true,
+  });
+
   const info = await tube.getBasicInfo(videoId);
   const formats = info.streaming_data?.adaptive_formats?.filter(
     f => f.mime_type?.includes('audio') && f.url
@@ -35,30 +37,41 @@ async function getAudioUrl(videoId) {
   return result;
 }
 
-const server = createServer(async (req, res) => {
-  // CORS
+function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
   res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Type');
+}
 
+const server = createServer(async (req, res) => {
+  setCors(res);
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
+
+  // Health check
+  if (url.pathname === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', cache_size: cache.size }));
+    return;
+  }
+
   const videoId = url.searchParams.get('id');
   const mode = url.searchParams.get('mode') || 'proxy';
 
   if (!videoId) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Missing ?id=VIDEO_ID' }));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ service: 'raga-ytaudio', usage: '/?id=VIDEO_ID or /?id=VIDEO_ID&mode=json' }));
     return;
   }
 
   try {
+    console.log(`[${new Date().toISOString()}] Extracting audio for: ${videoId}`);
     const audio = await getAudioUrl(videoId);
     if (!audio) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'No audio found' }));
+      res.end(JSON.stringify({ error: 'No audio found for this video' }));
       return;
     }
 
@@ -68,25 +81,46 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // Proxy mode: stream audio
+    // Proxy mode: stream audio from YouTube through this server
+    console.log(`[${new Date().toISOString()}] Streaming ${videoId} (${audio.size} bytes, ${audio.mime})`);
     const range = req.headers.range || 'bytes=0-';
     const upstream = await fetch(audio.url, {
       headers: { 'User-Agent': ANDROID_UA, 'Range': range },
     });
 
-    const headers = {
-      'Content-Type': audio.mime,
-      'Accept-Ranges': 'bytes',
-      'Cache-Control': 'public, max-age=3600',
-    };
-    const cl = upstream.headers.get('content-length');
-    const cr = upstream.headers.get('content-range');
-    if (cl) headers['Content-Length'] = cl;
-    if (cr) headers['Content-Range'] = cr;
+    if (!upstream.ok && upstream.status !== 206) {
+      // URL might have expired — clear cache and retry once
+      cache.delete(videoId);
+      const fresh = await getAudioUrl(videoId);
+      if (!fresh) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Audio stream unavailable' }));
+        return;
+      }
+      const retry = await fetch(fresh.url, {
+        headers: { 'User-Agent': ANDROID_UA, 'Range': range },
+      });
+      if (!retry.ok && retry.status !== 206) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Stream failed after retry' }));
+        return;
+      }
+      // Stream retry response
+      const rHeaders = { 'Content-Type': fresh.mime, 'Accept-Ranges': 'bytes', 'Cache-Control': 'public, max-age=3600' };
+      if (retry.headers.get('content-length')) rHeaders['Content-Length'] = retry.headers.get('content-length');
+      if (retry.headers.get('content-range')) rHeaders['Content-Range'] = retry.headers.get('content-range');
+      res.writeHead(retry.status, rHeaders);
+      const reader = retry.body.getReader();
+      const pump = async () => { while (true) { const { done, value } = await reader.read(); if (done) { res.end(); break; } res.write(value); } };
+      pump().catch(() => res.end());
+      return;
+    }
 
+    const headers = { 'Content-Type': audio.mime, 'Accept-Ranges': 'bytes', 'Cache-Control': 'public, max-age=3600' };
+    if (upstream.headers.get('content-length')) headers['Content-Length'] = upstream.headers.get('content-length');
+    if (upstream.headers.get('content-range')) headers['Content-Range'] = upstream.headers.get('content-range');
     res.writeHead(upstream.status, headers);
-    
-    // Stream the response
+
     const reader = upstream.body.getReader();
     const pump = async () => {
       while (true) {
@@ -97,9 +131,12 @@ const server = createServer(async (req, res) => {
     };
     pump().catch(() => res.end());
   } catch (e) {
+    console.error(`[${new Date().toISOString()}] Error for ${videoId}:`, e.message);
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: e.message }));
   }
 });
 
-server.listen(PORT, () => console.log(`YouTube audio proxy running on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`YouTube audio proxy running on port ${PORT}`);
+});
